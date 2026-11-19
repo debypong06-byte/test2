@@ -1,0 +1,206 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no"/>
+<title>安瞳AI - 視障出行輔助</title>
+<style>
+*{margin:0;padding:0;box-sizing:border-box;font-family:system-ui}
+body{background:#000;color:#fff;overflow:hidden}
+#video{width:100%;display:block}
+#canvas{position:absolute;top:0;left:0;width:100%;height:100%}
+#status{
+    position:fixed;bottom:20px;left:50%;transform:translateX(-50%);
+    background:rgba(0,0,0,0.75);padding:12px 20px;border-radius:99px;font-size:17px;
+}
+#tip{
+    position:fixed;top:12px;left:12px;background:rgba(0,0,0,0.6);padding:8px 12px;border-radius:8px;font-size:14px;
+}
+</style>
+</head>
+<body>
+<div id="tip">待喚醒：說「安瞳AI」啟動識別</div>
+<video id="video" autoplay playsinline muted></video>
+<canvas id="canvas"></canvas>
+<div id="status">等待指令</div>
+
+<script>
+const video = document.getElementById('video');
+const canvas = document.getElementById('canvas');
+const ctx = canvas.getContext('2d');
+const statusDom = document.getElementById('status');
+const tipDom = document.getElementById('tip');
+
+// ========== 配置（你要改這裡！填入你的DeepSeek API Key）==========
+const DEEPSEEK_API_KEY = "填入你的DeepSeek API Key";
+const WAKE_WORD = "安瞳AI";
+let isRunning = false;
+let lastAnalyseTime = 0;
+const INTERVAL = 2200; // 每2.2秒分析一次畫面，避免API額度炸掉
+
+// 畫布跟隨視頻尺寸
+function resizeCanvas(){
+    canvas.width = video.offsetWidth;
+    canvas.height = video.offsetHeight;
+}
+window.addEventListener('resize', resizeCanvas);
+
+// 語音播報
+function speak(text){
+    const utter = new SpeechSynthesisUtterance(text);
+    utter.lang = "zh-CN";
+    speechSynthesis.speak(utter);
+}
+
+// 開啟後置鏡頭
+async function openCamera(){
+    try{
+        const stream = await navigator.mediaDevices.getUserMedia({
+            video: {facingMode:"environment", width:{ideal:1280}, height:{ideal:720}}
+        });
+        video.srcObject = stream;
+        video.onloadedmetadata = ()=>{resizeCanvas();}
+        statusDom.innerText = "鏡頭已開啟，講「安瞳AI」啟動";
+    }catch(e){
+        statusDom.innerText = "相機權限失敗，請允許相機";
+    }
+}
+
+// 語音識別（聽喚醒詞「安瞳AI」）
+function startRecognition(){
+    if(!window.SpeechRecognition && !window.webkitSpeechRecognition){
+        tipDom.innerText = "瀏覽器不支援語音喚醒";
+        return;
+    }
+    const Rec = window.SpeechRecognition || window.webkitSpeechRecognition;
+    const rec = new Rec();
+    rec.continuous = true;
+    rec.interimResults = true;
+    rec.lang = "zh-CN";
+
+    rec.onresult = (e)=>{
+        const text = Array.from(e.results)
+            .map(r=>r[0].transcript)
+            .join("");
+        if(text.includes(WAKE_WORD) && !isRunning){
+            isRunning = true;
+            tipDom.innerText = "✅ 已喚醒，持續分析畫面";
+            speak("安瞳AI已啟動，開始環境偵測");
+            startAnalyseLoop();
+        }
+    }
+    rec.onerror = ()=>{}
+    rec.start();
+}
+
+// 截圖，轉成base64給DeepSeek
+function getImageBase64(){
+    const tempCanvas = document.createElement('canvas');
+    tempCanvas.width = video.videoWidth;
+    tempCanvas.height = video.videoHeight;
+    const tctx = tempCanvas.getContext('2d');
+    tctx.drawImage(video,0,0);
+    return tempCanvas.toDataURL("image/jpeg",0.7);
+}
+
+// 呼叫DeepSeek視覺API，分析盲道方向、斑馬線、紅綠燈、障礙物
+async function analyseByDeepSeek(){
+    const imgBase64 = getImageBase64();
+    const prompt = `你是視障出行輔助AI。分析圖片，輸出JSON，只有json，不要其他文字。
+要求：
+1. 識別：盲道、斑馬線、紅綠燈、障礙物
+2. 盲道：輸出方向【向前/向左/向右/盲道斷開】
+3. 紅綠燈：紅燈/綠燈/無
+4. 障礙物：有/無
+5. 斑馬線：有/無
+格式範例：
+{"mangdao":"向前","crosswalk":"有","light":"綠燈","obstacle":"無","voice":"檢測到盲道向前，前方有斑馬線，綠燈，可以通行"}
+`
+    try{
+        const res = await fetch("https://api.deepseek.com/v1/chat/completions",{
+            method:"POST",
+            headers:{
+                "Authorization":`Bearer ${DEEPSEEK_API_KEY}`,
+                "Content-Type":"application/json"
+            },
+            body:JSON.stringify({
+                model:"deepseek-vl2",
+                messages:[
+                    {role:"user", content:[
+                        {type:"text", text:prompt},
+                        {type:"image_url", image_url:{url:imgBase64}}
+                    ]}
+                ],
+                temperature:0.1
+            })
+        })
+        const data = await res.json();
+        const raw = data.choices[0].message.content.trim();
+        const jsonStr = raw.replace(/```json|```/g,"");
+        const obj = JSON.parse(jsonStr);
+
+        // 更新畫面提示 + 語音
+        statusDom.innerText = obj.voice;
+        speak(obj.voice);
+        drawBox(obj);
+    }catch(err){
+        console.error(err);
+        statusDom.innerText = "識別失敗";
+    }
+}
+
+// 在畫面畫標記（直觀顯示分析結果）
+function drawBox(result){
+    ctx.clearRect(0,0,canvas.width,canvas.height);
+    ctx.lineWidth = 4;
+    ctx.font = "18px sans-serif";
+    // 盲道綠框
+    if(result.mangdao && result.mangdao !== "無"){
+        ctx.strokeStyle="#00ff66";
+        ctx.strokeRect(canvas.width*0.1, canvas.height*0.2, canvas.width*0.8, canvas.height*0.6);
+        ctx.fillStyle="#00ff66";
+        ctx.fillText("盲道:"+result.mangdao, 16, 32);
+    }
+    // 斑馬線藍框
+    if(result.crosswalk === "有"){
+        ctx.strokeStyle="#33aaff";
+        ctx.strokeRect(canvas.width*0.15, canvas.height*0.3, canvas.width*0.7, canvas.height*0.5);
+        ctx.fillStyle="#33aaff";
+        ctx.fillText("斑馬線",16,60);
+    }
+    // 紅綠燈
+    if(result.light === "紅燈"){
+        ctx.fillStyle="#ff4444";
+        ctx.fillText("紅燈",16,88);
+    }else if(result.light === "綠燈"){
+        ctx.fillStyle="#44ff44";
+        ctx.fillText("綠燈",16,88);
+    }
+    // 障礙物紅警告
+    if(result.obstacle === "有"){
+        ctx.strokeStyle="#ff2222";
+        ctx.strokeRect(canvas.width*0.3, canvas.height*0.4, canvas.width*0.4, canvas.height*0.35);
+        ctx.fillStyle="#ff2222";
+        ctx.fillText("⚠️障礙物",16,116);
+    }
+}
+
+// 循環分析畫面
+async function startAnalyseLoop(){
+    if(!isRunning) return;
+    const now = Date.now();
+    if(now - lastAnalyseTime > INTERVAL){
+        lastAnalyseTime = now;
+        await analyseByDeepSeek();
+    }
+    requestAnimationFrame(startAnalyseLoop);
+}
+
+// 啟動
+(async ()=>{
+    await openCamera();
+    startRecognition();
+})()
+</script>
+</body>
+</html>
